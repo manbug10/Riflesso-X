@@ -29,10 +29,15 @@ use winit::platform::wayland::{EventLoopBuilderExtWayland, WindowAttributesExtWa
 use winit::platform::windows::{EventLoopBuilderExtWindows, IconExtWindows, WindowAttributesExtWindows};
 #[cfg(windows)]
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use winit::window::{Fullscreen, Icon, Window, WindowAttributes, WindowId};
+use winit::window::{CursorIcon, Fullscreen, Icon, ResizeDirection, Window, WindowAttributes, WindowId};
 
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 const TITLE: &str = "Riflesso X";
+/// Width, in physical pixels, of the invisible strip along the window's edges
+/// that can be dragged to resize it (the window has no border of its own).
+const RESIZE_BORDER: f64 = 8.0;
+/// The smallest width the window can be resized to.
+const MIN_WIDTH: u32 = 160;
 /// The app icon, embedded in the executable under this id (by tauri-build for
 /// the app, by `cli/build.rs` for the command line).
 #[cfg(windows)]
@@ -103,6 +108,12 @@ struct MirrorWindow {
     /// When the current mirror stream began, to measure the time to the first picture.
     stream_started: Option<Instant>,
     last_click: Option<Instant>,
+    /// Last cursor position inside the window, in physical pixels.
+    cursor: PhysicalPosition<f64>,
+    /// The window edge under the cursor, if any.
+    edge: Option<ResizeDirection>,
+    /// The edge being dragged right now, to keep the picture's proportions.
+    resizing: Option<ResizeDirection>,
     decode_errors: u32,
     present_errors: u32,
     stats: Stats,
@@ -135,6 +146,9 @@ impl MirrorWindow {
             sender: None,
             stream_started: None,
             last_click: None,
+            cursor: PhysicalPosition::new(-1.0, -1.0),
+            edge: None,
+            resizing: None,
             decode_errors: 0,
             present_errors: 0,
             stats: Stats::new(),
@@ -355,6 +369,45 @@ impl MirrorWindow {
         self.window = None;
     }
 
+    /// Updates the edge under the cursor and the cursor's shape.
+    fn cursor_moved(&mut self, position: PhysicalPosition<f64>) {
+        self.cursor = position;
+        self.resizing = None;
+        let Some(window) = &self.window else { return };
+        let edge = if window.fullscreen().is_some() || window.is_maximized() {
+            None
+        } else {
+            let size = window.inner_size();
+            edge_at(position, (size.width as f64, size.height as f64))
+        };
+        if edge != self.edge {
+            self.edge = edge;
+            window.set_cursor(edge.map_or(CursorIcon::Default, CursorIcon::from));
+        }
+    }
+
+    /// While the user drags an edge, forces the picture's proportions on the
+    /// window: the dimension being dragged decides, the other follows.
+    fn keep_aspect(&mut self, size: PhysicalSize<u32>) -> PhysicalSize<u32> {
+        let (Some(direction), Some(window), Some((w, h))) = (self.resizing, &self.window, self.frame_size) else {
+            return size;
+        };
+        if size.width == 0 || size.height == 0 || window.fullscreen().is_some() || window.is_maximized() {
+            return size;
+        }
+        let ratio = w as f64 / h as f64;
+        let by_height = matches!(direction, ResizeDirection::North | ResizeDirection::South);
+        let wanted = if by_height {
+            PhysicalSize::new((size.height as f64 * ratio).round() as u32, size.height)
+        } else {
+            PhysicalSize::new(size.width, (size.width as f64 / ratio).round() as u32)
+        };
+        if wanted.width.abs_diff(size.width) <= 1 && wanted.height.abs_diff(size.height) <= 1 {
+            return size;
+        }
+        window.request_inner_size(wanted).unwrap_or(wanted)
+    }
+
     fn toggle_fullscreen(&self) {
         if let Some(window) = &self.window {
             let next = match window.fullscreen() {
@@ -396,7 +449,7 @@ impl ApplicationHandler<MirrorEvent> for MirrorWindow {
                     RawWindowHandle::Win32(handle) => handle.hwnd.get(),
                     other => anyhow::bail!("unsupported window handle {other:?}"),
                 };
-                style_title_bar(hwnd);
+                style_borderless(hwnd);
                 self.hwnd = hwnd;
                 let size = window.inner_size();
                 let video = VideoOutput::new(hwnd, size.width, size.height)?;
@@ -419,7 +472,12 @@ impl ApplicationHandler<MirrorEvent> for MirrorWindow {
                 self.hide_window();
                 let _ = self.closed.send(());
             }
-            WindowEvent::Resized(size) => self.resized(size),
+            WindowEvent::Resized(size) => {
+                let size = self.keep_aspect(size);
+                self.resized(size);
+            }
+            WindowEvent::CursorMoved { position, .. } => self.cursor_moved(position),
+            WindowEvent::CursorLeft { .. } => self.cursor_moved(PhysicalPosition::new(-1.0, -1.0)),
             WindowEvent::RedrawRequested => self.dirty = true,
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed && !event.repeat => {
                 match event.logical_key {
@@ -433,12 +491,27 @@ impl ApplicationHandler<MirrorEvent> for MirrorWindow {
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
+                // On an edge: resize instead of move.
+                if let Some(direction) = self.edge
+                    && let Some(window) = &self.window
+                    && window.drag_resize_window(direction).is_ok()
+                {
+                    self.resizing = Some(direction);
+                    self.last_click = None;
+                    return;
+                }
                 let now = Instant::now();
                 if self.last_click.is_some_and(|t| now - t < DOUBLE_CLICK) {
                     self.toggle_fullscreen();
                     self.last_click = None;
                 } else {
                     self.last_click = Some(now);
+                    // No title bar: drag the picture to move the window.
+                    if let Some(window) = &self.window
+                        && window.fullscreen().is_none()
+                    {
+                        let _ = window.drag_window();
+                    }
                 }
             }
             _ => {}
@@ -495,7 +568,13 @@ impl ApplicationHandler<MirrorEvent> for MirrorWindow {
 
 fn window_attributes() -> WindowAttributes {
     let icon = app_icon().inspect_err(|e| tracing::warn!("cannot load the app icon: {e:#}")).ok();
-    let attributes = Window::default_attributes().with_title(TITLE).with_window_icon(icon.clone());
+    // Clean window: no title bar, no close/minimize buttons. It is moved by
+    // dragging the picture (see `WindowEvent::MouseInput`).
+    let attributes = Window::default_attributes()
+        .with_title(TITLE)
+        .with_decorations(false)
+        .with_min_inner_size(PhysicalSize::new(MIN_WIDTH, MIN_WIDTH))
+        .with_window_icon(icon.clone());
     #[cfg(windows)]
     let attributes = attributes.with_taskbar_icon(icon);
     #[cfg(target_os = "linux")]
@@ -522,6 +601,29 @@ fn app_icon() -> Result<Icon> {
     Ok(Icon::from_rgba(rgba, frame.width, frame.height)?)
 }
 
+/// The edge or corner of a window of `size` that a cursor at `position` is on.
+fn edge_at(position: PhysicalPosition<f64>, (width, height): (f64, f64)) -> Option<ResizeDirection> {
+    let (x, y) = (position.x, position.y);
+    if x < 0.0 || y < 0.0 || x >= width || y >= height {
+        return None;
+    }
+    let left = x < RESIZE_BORDER;
+    let right = x >= width - RESIZE_BORDER;
+    let top = y < RESIZE_BORDER;
+    let bottom = y >= height - RESIZE_BORDER;
+    match (left, right, top, bottom) {
+        (true, _, true, _) => Some(ResizeDirection::NorthWest),
+        (_, true, true, _) => Some(ResizeDirection::NorthEast),
+        (true, _, _, true) => Some(ResizeDirection::SouthWest),
+        (_, true, _, true) => Some(ResizeDirection::SouthEast),
+        (true, ..) => Some(ResizeDirection::West),
+        (_, true, ..) => Some(ResizeDirection::East),
+        (_, _, true, _) => Some(ResizeDirection::North),
+        (_, _, _, true) => Some(ResizeDirection::South),
+        _ => None,
+    }
+}
+
 /// The largest size with the picture's proportions that fits the work area,
 /// leaving `frame` (title bar and borders) around it.
 fn fitted_size(work: &WorkArea, (frame_w, frame_h): (f64, f64), (w, h): (u32, u32)) -> PhysicalSize<u32> {
@@ -536,28 +638,23 @@ fn fitted_size(work: &WorkArea, (frame_w, frame_h): (f64, f64), (w, h): (u32, u3
     PhysicalSize::new((w as f64 * scale) as u32, (h as f64 * scale) as u32)
 }
 
-/// Paints the title bar in the app's ink colour, with light text and buttons.
-/// Windows 10 does not support these attributes and keeps its own colours.
+/// Makes the window a clean rectangle: Windows 11 would otherwise round the
+/// corners of the borderless window and draw a thin border around it.
 #[cfg(windows)]
-fn style_title_bar(hwnd: isize) {
+fn style_borderless(hwnd: isize) {
     use windows::Win32::Foundation::HWND;
-    use windows::Win32::Graphics::Dwm::{
-        DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWINDOWATTRIBUTE,
-        DwmSetWindowAttribute,
-    };
+    use windows::Win32::Graphics::Dwm::{DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DwmSetWindowAttribute};
 
-    // Colours are COLORREF values: 0x00BBGGRR.
-    let attributes: [(DWMWINDOWATTRIBUTE, u32); 4] = [
-        (DWMWA_USE_IMMERSIVE_DARK_MODE, 1),
-        (DWMWA_CAPTION_COLOR, 0x0018_120e), // #0e1218, ink
-        (DWMWA_TEXT_COLOR, 0x00f5_f1ee),    // #eef1f5
-        (DWMWA_BORDER_COLOR, 0x0030_241c),  // #1c2430, top of the icon's plate
-    ];
+    const DWMWCP_DONOTROUND: u32 = 1;
+    const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFE;
+
     let hwnd = HWND(hwnd as *mut _);
-    for (attribute, value) in attributes {
-        let value = std::ptr::from_ref(&value).cast();
-        // SAFETY: `hwnd` is our live window and `value` points to a u32 of the size given.
-        let _ = unsafe { DwmSetWindowAttribute(hwnd, attribute, value, size_of::<u32>() as u32) };
+    let corners = DWMWCP_DONOTROUND;
+    let border = DWMWA_COLOR_NONE;
+    // SAFETY: `hwnd` is our live window and each value points to a u32 of the size given.
+    unsafe {
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, std::ptr::from_ref(&corners).cast(), size_of::<u32>() as u32);
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, std::ptr::from_ref(&border).cast(), size_of::<u32>() as u32);
     }
 }
 
