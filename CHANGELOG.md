@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.2.0
+
+- Cleaner mirroring window: no title bar and no close, minimize or maximize
+  buttons; Windows 11 no longer rounds its corners or draws a border around
+  it either.
+- The window moves by dragging the picture with the left button.
+- It resizes from its edges and corners, through an invisible 8 px strip
+  along the border, keeping the picture's proportions and never smaller
+  than 160 px. Full screen and maximized windows ignore it.
+- Full screen still toggles with a double click or F11, and Esc leaves it.
+- Without a title bar, the window closes with Alt+F4, or when mirroring
+  stops.
+
 ## 1.1.0
 
 - **Linux.** Riflesso X now runs on Linux too, as a .deb package (Ubuntu,
